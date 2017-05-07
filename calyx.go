@@ -3,7 +3,10 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"io/ioutil"
 	"log"
+	"os"
+	"path"
 	"sync"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -12,6 +15,12 @@ import (
 const numAnalyzers = 4
 const dbName = "file_info.db"
 
+// FileEntry captures the POSIX attributes for a filesystem entry (file, dir, link, ...)
+type FileEntry struct {
+	path string
+	info os.FileInfo
+}
+
 func main() {
 	var wg sync.WaitGroup
 
@@ -19,16 +28,20 @@ func main() {
 		log.Fatal("Failed to create database table ", dbName, " with ", err)
 	}
 
-	done := make(chan interface{})
-	fileChannel := make(chan string)
+	fileChannel := make(chan FileEntry)
 	for i := 0; i < numAnalyzers; i++ {
 		db, err := sql.Open("sqlite3", dbName)
 		if err != nil {
 			log.Fatal("Failed to open database connection to ", dbName, " with ", err)
 		}
 		wg.Add(1)
-		go processor(fileChannel, db, done, &wg)
+		go analyzer(fileChannel, db, &wg)
 	}
+
+	if err := fileTreeWalker("/Users/markus/Downloads/", fileChannel); err != nil {
+		log.Fatal("file tree walk failed: ", err)
+	}
+
 	wg.Wait()
 }
 
@@ -56,14 +69,42 @@ func createTable() error {
 // paths to all file objects underneath to the file channel
 // TODO: This version should be replaced by a multithreaded version
 // for efficiency
-func fileTreeWalker(root string, files chan<- string) {
+func fileTreeWalker(rootPath string, files chan<- FileEntry) error {
+	defer close(files)
 
+	info, err := os.Stat(rootPath)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("Provided root path %s is not a directory", rootPath)
+	}
+
+	queue := []string{rootPath}
+	files <- FileEntry{path.Dir(rootPath), info}
+	for i := 0; i < len(queue); i++ {
+		dir := queue[i]
+		//dir := path.Dir(elem)
+		entries, err := ioutil.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				queue = append(queue, path.Join(dir, e.Name()))
+			}
+			files <- FileEntry{dir, e}
+		}
+	}
+	return nil
 }
 
 // analyzer processes files from the files channel, analyzes them and then
 // adds them to the database
-func processor(files <-chan string, conn *sql.DB, done chan interface{}, wg *sync.WaitGroup) {
+func analyzer(files <-chan FileEntry, conn *sql.DB, wg *sync.WaitGroup) {
 	defer conn.Close()
 	defer wg.Done()
-	fmt.Println("done processing")
+	for e := range files {
+		fmt.Println(path.Join(e.path, e.info.Name()))
+	}
 }
