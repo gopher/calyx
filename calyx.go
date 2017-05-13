@@ -7,8 +7,10 @@ import (
 	"log"
 	"os"
 	"path"
+	"strings"
 	"sync"
 
+	"github.com/gopher/gomagic"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -22,6 +24,12 @@ type FileEntry struct {
 }
 
 func main() {
+
+	if len(os.Args) == 1 {
+		log.Fatal("usage: calyx <filepath>")
+	}
+	filePath := os.Args[1]
+
 	var wg sync.WaitGroup
 
 	if err := createTable(); err != nil {
@@ -38,7 +46,7 @@ func main() {
 		go analyzer(fileChannel, db, &wg)
 	}
 
-	if err := fileTreeWalker("/Users/markus/Downloads/", fileChannel); err != nil {
+	if err := fileTreeWalker(filePath, fileChannel); err != nil {
 		log.Fatal("file tree walk failed: ", err)
 	}
 
@@ -55,8 +63,16 @@ func createTable() error {
 	}
 
 	sqlStmt := `
-	create table file_info (id integer not null primary key, name text, size int64, mode int64, time string, is_dir bool);
-	delete from file_info;
+	CREATE TABLE IF NOT EXISTS file_info (
+		id INTEGER NOT NULL PRIMARY KEY,
+		name TEXT,
+		size INT64,
+		mode INT64,
+		time STRING,
+		extension STRING,
+		is_dir BOOL,
+		short_file_info STRING,
+		file_info STRING);
 	`
 	_, err = db.Exec(sqlStmt)
 	if err != nil {
@@ -86,7 +102,6 @@ func fileTreeWalker(rootPath string, files chan<- FileEntry) error {
 		dir := queue[0]
 		queue = queue[1:]
 
-		//dir := path.Dir(elem)
 		entries, err := ioutil.ReadDir(dir)
 		if err != nil {
 			return err
@@ -106,7 +121,53 @@ func fileTreeWalker(rootPath string, files chan<- FileEntry) error {
 func analyzer(files <-chan FileEntry, conn *sql.DB, wg *sync.WaitGroup) {
 	defer conn.Close()
 	defer wg.Done()
+
+	// initialize gomagic
+	magic, err := gomagic.New(gomagic.NoneFlag)
+	if err != nil {
+		return
+	}
+
+	sqlAddEntry := `
+	INSERT OR REPLACE INTO file_info (
+		name,
+		size,
+		mode,
+		time,
+		extension,
+		is_dir,
+		short_file_info,
+		file_info
+	) values(?, ?, ?, ?, ?, ?, ?, ?)
+	`
+
+	stmt, err := conn.Prepare(sqlAddEntry)
+	if err != nil {
+		log.Fatal("Failed to prepare transaction")
+	}
+	defer stmt.Close()
+
 	for e := range files {
-		fmt.Println(path.Join(e.path, e.info.Name()))
+		filePath := path.Join(e.path, e.info.Name())
+		fileExt := path.Ext(e.info.Name())
+		// strip dot from extension
+		if len(fileExt) != 0 {
+			fileExt = fileExt[1:]
+		}
+		fileInfo, err := magic.ExamineFile(filePath)
+		if err != nil {
+			continue
+		}
+		shortFileInfo := ""
+		if fileInfo != "" {
+			shortFileInfo = strings.Split(fileInfo, ",")[0]
+		}
+		//fmt.Println(filePath, "  -->  ", shortFileInfo)
+
+		_, err = stmt.Exec(filePath, e.info.Size(), e.info.Mode(), e.info.ModTime(), fileExt,
+			e.info.IsDir(), shortFileInfo, fileInfo)
+		if err != nil {
+			log.Printf("Failed to %s insert transaction into database\n", filePath)
+		}
 	}
 }
