@@ -82,8 +82,10 @@ func fileTreeWalker(rootPath string, files chan<- FileEntry) error {
 
 	queue := []string{rootPath}
 	files <- FileEntry{path.Dir(rootPath), info}
-	for i := 0; i < len(queue); i++ {
-		dir := queue[i]
+	for len(queue) != 0 {
+		dir := queue[0]
+		queue = queue[1:]
+
 		//dir := path.Dir(elem)
 		entries, err := ioutil.ReadDir(dir)
 		if err != nil {
