@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -11,11 +12,24 @@ import (
 	"sync"
 
 	"github.com/gopher/gomagic"
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/lib/pq"
 )
 
-const numAnalyzers = 4
-const dbName = "file_info.db"
+const numAnalyzers = 1
+const txCommitInterval = 1000
+
+// command line options
+var dbUser string
+var dbName string
+var dbPass string
+var dbHost string
+
+func init() {
+	flag.StringVar(&dbUser, "u", "", "database user")
+	flag.StringVar(&dbName, "n", "", "database name")
+	flag.StringVar(&dbPass, "p", "", "database password")
+	flag.StringVar(&dbHost, "h", "", "database host")
+}
 
 // FileEntry captures the POSIX attributes for a filesystem entry (file, dir, link, ...)
 type FileEntry struct {
@@ -25,23 +39,26 @@ type FileEntry struct {
 
 func main() {
 
-	if len(os.Args) == 1 {
-		log.Fatal("usage: calyx <filepath>")
+	flag.Parse()
+	if dbUser == "" || dbName == "" || dbPass == "" || dbHost == "" {
+		Usage()
 	}
-	filePath := os.Args[1]
+
+	if len(flag.Args()) == 0 {
+		Usage()
+	}
+	filePath := flag.Args()[0]
 
 	var wg sync.WaitGroup
 
-	if err := createTable(); err != nil {
-		log.Fatal("Failed to create database table ", dbName, " with ", err)
+	db, err := createTable()
+	if err != nil {
+		log.Fatal("Failed to create database table with ", err)
 	}
 
 	fileChannel := make(chan FileEntry)
+
 	for i := 0; i < numAnalyzers; i++ {
-		db, err := sql.Open("sqlite3", dbName)
-		if err != nil {
-			log.Fatal("Failed to open database connection to ", dbName, " with ", err)
-		}
 		wg.Add(1)
 		go analyzer(fileChannel, db, &wg)
 	}
@@ -55,30 +72,31 @@ func main() {
 
 // createTable creates the initial database table used for storing the
 // information of the file tree walk
-func createTable() error {
-	// create the initial database table
-	db, err := sql.Open("sqlite3", dbName)
+func createTable() (*sql.DB, error) {
+	authString := fmt.Sprintf("user=%s dbname=%s password=%s host=%s sslmode=disable",
+		dbUser, dbName, dbPass, dbHost)
+	db, err := sql.Open("postgres", authString)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	sqlStmt := `
 	CREATE TABLE IF NOT EXISTS file_info (
-		id INTEGER NOT NULL PRIMARY KEY,
+		id SERIAL NOT NULL PRIMARY KEY,
 		name TEXT,
-		size INT64,
-		mode INT64,
-		time STRING,
-		extension STRING,
-		is_dir BOOL,
-		short_file_info STRING,
-		file_info STRING);
+		size BIGINT,
+		mode BIGINT,
+		time TEXT,
+		extension TEXT,
+		is_dir BOOLEAN,
+		short_file_info TEXT,
+		file_info TEXT);
 	`
 	_, err = db.Exec(sqlStmt)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	return db, nil
 }
 
 // fileTreeWalker walks the POSIX file tree under root and sends the
@@ -103,8 +121,9 @@ func fileTreeWalker(rootPath string, files chan<- FileEntry) error {
 		queue = queue[1:]
 
 		entries, err := ioutil.ReadDir(dir)
+		// we ignore eny errors (such as permission denied, etc.), log them and soldier on
 		if err != nil {
-			return err
+			log.Println("fileTreeWalker: ", err)
 		}
 		for _, e := range entries {
 			if e.IsDir() {
@@ -118,56 +137,87 @@ func fileTreeWalker(rootPath string, files chan<- FileEntry) error {
 
 // analyzer processes files from the files channel, analyzes them and then
 // adds them to the database
-func analyzer(files <-chan FileEntry, conn *sql.DB, wg *sync.WaitGroup) {
-	defer conn.Close()
+func analyzer(files <-chan FileEntry, db *sql.DB, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	// initialize gomagic
 	magic, err := gomagic.New(gomagic.NoneFlag)
 	if err != nil {
 		return
 	}
 
 	sqlAddEntry := `
-	INSERT OR REPLACE INTO file_info (
-		name,
-		size,
-		mode,
-		time,
-		extension,
-		is_dir,
-		short_file_info,
-		file_info
-	) values(?, ?, ?, ?, ?, ?, ?, ?)
-	`
+		INSERT INTO file_info (
+			name,
+			size,
+			mode,
+			time,
+			extension,
+			is_dir,
+			short_file_info,
+			file_info
+		) values($1, $2, $3, $4, $5, $6, $7, $8);
+		`
 
-	stmt, err := conn.Prepare(sqlAddEntry)
-	if err != nil {
-		log.Fatal("Failed to prepare transaction")
-	}
-	defer stmt.Close()
-
+	txCount := 0
+	var tx *sql.Tx
+	var stmt *sql.Stmt
 	for e := range files {
+
+		// prepare new transaction; if it fails we bail for now
+		if txCount == 0 {
+			tx, err = db.Begin()
+			if err != nil {
+				log.Fatal("Failed to prepare transaction")
+			}
+			stmt, err = tx.Prepare(sqlAddEntry)
+			if err != nil {
+				log.Fatal("Failed to open database")
+			}
+		}
+
 		filePath := path.Join(e.path, e.info.Name())
+		if e.info.IsDir() {
+			filePath = e.path
+		}
 		fileExt := path.Ext(e.info.Name())
+
 		// strip dot from extension
 		if len(fileExt) != 0 {
 			fileExt = fileExt[1:]
 		}
+
 		fileInfo, err := magic.ExamineFile(filePath)
 		if err != nil {
-			continue
+			log.Println("gomagic failed on ", filePath, " with", err)
 		}
+
 		shortFileInfo := ""
 		if fileInfo != "" {
 			shortFileInfo = strings.Split(fileInfo, ",")[0]
 		}
-		//fmt.Println(filePath, "  -->  ", shortFileInfo)
 
-		_, err = stmt.Exec(filePath, e.info.Size(), e.info.Mode(), e.info.ModTime(), fileExt,
-			e.info.IsDir(), shortFileInfo, fileInfo)
-		if err != nil {
-			log.Printf("Failed to %s insert transaction into database\n", filePath)
+		if _, err = stmt.Exec(filePath, e.info.Size(), e.info.Mode(), e.info.ModTime(), fileExt,
+			e.info.IsDir(), shortFileInfo, fileInfo); err != nil {
+			log.Printf("Failed to %s insert transaction into database with: %s\n", filePath, err)
+		}
+
+		txCount++
+		if txCount == txCommitInterval {
+			tx.Commit()
+			stmt.Close()
+			txCount = 0
 		}
 	}
+
+	// make sure to commit the last transaction in flight
+	if txCount != 0 {
+		tx.Commit()
+	}
+}
+
+// Usage prints the a quick info on how to use the client
+func Usage() {
+	fmt.Println("Usage: calxy -h <host> -n <dbname> -p <dbpass> -u <dbuser> file_tree_root")
+	flag.PrintDefaults()
+	os.Exit(1)
 }
